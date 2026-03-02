@@ -6,6 +6,7 @@ with added tf_static, camera_info, and filtered pointclouds.
 """
 
 import os
+import struct
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Any
 
@@ -20,7 +21,21 @@ from .camera_info import (
     get_camera_info_topic, get_intrinsics_for_image_topic
 )
 from .pointcloud import filter_zed_pointcloud
+from .lidar_odometry import (
+    LidarOdometry, KISS_ICP_AVAILABLE,
+    pose_to_odometry_dict, pose_to_tf_msg_dict,
+    compute_odom_base_link, compute_odom_sensor, build_sensor_transform,
+)
 
+
+# LiDAR odometry constants
+LIDAR_POINTS_TOPIC = '/ouster/points'
+LIDAR_ODOM_OUTPUT_TOPIC = '/kiss_icp/odom'
+
+# Topics whose header.stamp may use the Ouster internal oscillator (boot time)
+# instead of Unix epoch time. When fix_ouster_timestamps is enabled, their
+# header.stamp is replaced with the MCAP log_time (wall-clock).
+OUSTER_TIMESTAMP_TOPICS = {'/ouster/points', '/ouster/imu'}
 
 # Default topics to include in output
 DEFAULT_TOPICS = [
@@ -35,6 +50,7 @@ DEFAULT_TOPICS = [
     '/camera/side_left/image_raw/camera_info',
     '/camera/side_right/image_raw/camera_info',
     '/camera/zed_left_camera/image_raw/camera_info',
+    '/kiss_icp/odom',
     '/novatel/oem7/bestpos',
     '/novatel/oem7/fix',
     '/novatel/oem7/odom',
@@ -83,6 +99,24 @@ POINTCLOUD_TOPICS_TO_FILTER = {
 }
 
 
+def patch_cdr_header_stamp(raw_data: bytes, timestamp_ns: int) -> bytes:
+    """Patch header.stamp in a CDR-encoded ROS 2 message.
+
+    Standard ROS 2 CDR layout for messages starting with std_msgs/Header:
+      bytes 0-3 : CDR encapsulation header (e.g. 0x00 0x01 0x00 0x00)
+      bytes 4-7 : header.stamp.sec   (int32,  little-endian)
+      bytes 8-11: header.stamp.nanosec (uint32, little-endian)
+
+    Works for sensor_msgs/PointCloud2, sensor_msgs/Imu, and any message
+    whose first field is a std_msgs/Header.
+    """
+    sec = int(timestamp_ns // 1_000_000_000)
+    nanosec = int(timestamp_ns % 1_000_000_000)
+    patched = bytearray(raw_data)
+    struct.pack_into('<iI', patched, 4, sec, nanosec)
+    return bytes(patched)
+
+
 @dataclass
 class ProcessingStats:
     """Statistics from bag processing."""
@@ -91,6 +125,8 @@ class ProcessingStats:
     passthrough_messages: int = 0
     generated_camera_info: int = 0
     filtered_pointclouds: int = 0
+    generated_lidar_odom: int = 0
+    patched_ouster_timestamps: int = 0
     skipped_messages: int = 0
     topics_found: Set[str] = field(default_factory=set)
 
@@ -107,9 +143,13 @@ class ProcessorConfig:
     generate_camera_info: bool = True
     generate_tf_static: bool = True
     add_map_odom_tf: bool = True
+    generate_lidar_odom: bool = False
+    fix_ouster_timestamps: bool = False
     pointcloud_voxel_size: float = 0.2
     pointcloud_min_points: int = 2
     pointcloud_max_range: float = 100.0
+    lidar_odom_max_range: float = 100.0
+    lidar_odom_min_range: float = 1.0
 
 
 class McapBagProcessor:
@@ -138,6 +178,32 @@ class McapBagProcessor:
         self.camera_intrinsics = {}
         if config.generate_camera_info and config.calibration_dir:
             self.camera_intrinsics = load_all_intrinsics(config.calibration_dir)
+        
+        # Initialise LiDAR odometry (KISS-ICP)
+        self.lidar_odom: Optional[LidarOdometry] = None
+        self._T_base_sensor: Optional[Any] = None
+        if config.generate_lidar_odom:
+            if not KISS_ICP_AVAILABLE:
+                raise ImportError(
+                    "kiss-icp is required for LiDAR odometry. "
+                    "Install it with: pip install kiss-icp"
+                )
+            self.lidar_odom = LidarOdometry(
+                max_range=config.lidar_odom_max_range,
+                min_range=config.lidar_odom_min_range,
+            )
+            # Look up base_link->os_sensor from URDF for proper TF computation
+            for tf in self.transforms:
+                if tf.child_frame == 'os_sensor' and tf.parent_frame == 'base_link':
+                    self._T_base_sensor = build_sensor_transform(
+                        tf.translation, tf.rotation,
+                    )
+                    break
+            # Remove odom->base_link identity from static TFs (dynamic TF replaces it)
+            self.transforms = [
+                tf for tf in self.transforms
+                if not (tf.parent_frame == 'odom' and tf.child_frame == 'base_link')
+            ]
         
         # Encoder cache for dynamically generated messages
         self._encoder_cache: Dict[str, Callable] = {}
@@ -241,8 +307,22 @@ class McapBagProcessor:
                     # Check if topic should be included
                     topic_included = channel.topic in self.config.topics_to_include
                     
+                    # Patch Ouster timestamps: replace header.stamp with log_time
+                    if (topic_included
+                            and self.config.fix_ouster_timestamps
+                            and channel.topic in OUSTER_TIMESTAMP_TOPICS):
+                        patched_data = patch_cdr_header_stamp(message.data, message.log_time)
+                        self._write_raw_message(
+                            writer, channel.topic,
+                            schema.name, schema.data.decode('utf-8'),
+                            patched_data, message.log_time,
+                            registered_channels, schemas, schema_texts
+                        )
+                        self.stats.patched_ouster_timestamps += 1
+                        self.stats.processed_messages += 1
+                    
                     # Handle passthrough topics - copy raw bytes directly
-                    if topic_included and channel.topic in PASSTHROUGH_TOPICS:
+                    elif topic_included and channel.topic in PASSTHROUGH_TOPICS:
                         self._write_raw_message(
                             writer, channel.topic, 
                             schema.name, schema.data.decode('utf-8'),
@@ -315,6 +395,62 @@ class McapBagProcessor:
                                     registered_channels, schemas, schema_texts
                                 )
                                 self.stats.generated_camera_info += 1
+                    
+                    # Generate LiDAR odometry from Ouster pointclouds
+                    if (self.lidar_odom is not None and
+                            channel.topic == LIDAR_POINTS_TOPIC):
+                        try:
+                            decoder = DecoderFactory()
+                            decoder_fn = decoder.decoder_for('cdr', schema)
+                            if decoder_fn:
+                                decoded_msg = decoder_fn(message.data)
+                                odom_msg = self.lidar_odom.process_pointcloud(
+                                    decoded_msg, message.log_time
+                                )
+                                if odom_msg is not None:
+                                    T_kiss = self.lidar_odom.last_pose
+
+                                    if self._T_base_sensor is not None:
+                                        T_odom_base = compute_odom_base_link(
+                                            T_kiss, self._T_base_sensor,
+                                        )
+                                        T_odom_sensor = compute_odom_sensor(
+                                            T_kiss, self._T_base_sensor,
+                                        )
+                                    else:
+                                        T_odom_base = T_kiss
+                                        T_odom_sensor = T_kiss
+
+                                    # Write corrected nav_msgs/Odometry
+                                    corrected_odom = pose_to_odometry_dict(
+                                        T_odom_sensor, message.log_time,
+                                        frame_id='odom',
+                                        child_frame_id='os_sensor',
+                                    )
+                                    self._write_encoded_message(
+                                        writer, LIDAR_ODOM_OUTPUT_TOPIC,
+                                        'nav_msgs/msg/Odometry',
+                                        ODOMETRY_SCHEMA,
+                                        corrected_odom, message.log_time,
+                                        registered_channels, schemas, schema_texts
+                                    )
+
+                                    # Write odom->base_link on /tf
+                                    tf_msg = pose_to_tf_msg_dict(
+                                        T_odom_base, message.log_time,
+                                        frame_id='odom',
+                                        child_frame_id='base_link',
+                                    )
+                                    self._write_encoded_message(
+                                        writer, '/tf',
+                                        'tf2_msgs/msg/TFMessage',
+                                        TF_MESSAGE_SCHEMA,
+                                        tf_msg, message.log_time,
+                                        registered_channels, schemas, schema_texts
+                                    )
+                                    self.stats.generated_lidar_odom += 1
+                        except Exception as e:
+                            print(f"Warning: LiDAR odometry failed on frame: {e}")
                 
                 writer.finish()
         
@@ -487,6 +623,53 @@ uint32 y_offset
 uint32 height
 uint32 width
 bool do_rectify
+""".strip()
+
+ODOMETRY_SCHEMA = """
+std_msgs/Header header
+string child_frame_id
+geometry_msgs/PoseWithCovariance pose
+geometry_msgs/TwistWithCovariance twist
+================================================================================
+MSG: std_msgs/Header
+builtin_interfaces/Time stamp
+string frame_id
+================================================================================
+MSG: builtin_interfaces/Time
+int32 sec
+uint32 nanosec
+================================================================================
+MSG: geometry_msgs/PoseWithCovariance
+geometry_msgs/Pose pose
+float64[36] covariance
+================================================================================
+MSG: geometry_msgs/Pose
+geometry_msgs/Point position
+geometry_msgs/Quaternion orientation
+================================================================================
+MSG: geometry_msgs/Point
+float64 x
+float64 y
+float64 z
+================================================================================
+MSG: geometry_msgs/Quaternion
+float64 x
+float64 y
+float64 z
+float64 w
+================================================================================
+MSG: geometry_msgs/TwistWithCovariance
+geometry_msgs/Twist twist
+float64[36] covariance
+================================================================================
+MSG: geometry_msgs/Twist
+geometry_msgs/Vector3 linear
+geometry_msgs/Vector3 angular
+================================================================================
+MSG: geometry_msgs/Vector3
+float64 x
+float64 y
+float64 z
 """.strip()
 
 

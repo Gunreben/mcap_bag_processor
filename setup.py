@@ -18,6 +18,9 @@ setup(
         'numpy',
         'pyyaml',
     ],
+    extras_require={
+        'lidar_odom': ['kiss-icp'],
+    },
     zip_safe=True,
     maintainer='User',
     maintainer_email='user@example.com',
