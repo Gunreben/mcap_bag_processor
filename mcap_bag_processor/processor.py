@@ -10,6 +10,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Any
 
+import yaml
 from mcap.reader import make_reader
 from mcap.writer import Writer
 from mcap_ros2.decoder import DecoderFactory
@@ -129,6 +130,12 @@ class ProcessingStats:
     patched_ouster_timestamps: int = 0
     skipped_messages: int = 0
     topics_found: Set[str] = field(default_factory=set)
+    # Metadata collected during processing (for metadata.yaml generation)
+    output_path: str = ''
+    start_time: Optional[int] = None
+    end_time: Optional[int] = None
+    output_topic_types: Dict[str, str] = field(default_factory=dict)
+    output_topic_counts: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass 
@@ -252,6 +259,7 @@ class McapBagProcessor:
             ProcessingStats with processing results
         """
         self.stats = ProcessingStats()
+        self.stats.output_path = self.config.output_path
         
         # Ensure output directory exists
         output_dir = os.path.dirname(self.config.output_path)
@@ -503,6 +511,16 @@ class McapBagProcessor:
         
         return registered_channels[topic]
     
+    def _track_output(self, topic: str, schema_name: str, timestamp: int):
+        """Record metadata about a written message for metadata.yaml generation."""
+        s = self.stats
+        s.output_topic_types.setdefault(topic, schema_name)
+        s.output_topic_counts[topic] = s.output_topic_counts.get(topic, 0) + 1
+        if s.start_time is None or timestamp < s.start_time:
+            s.start_time = timestamp
+        if s.end_time is None or timestamp > s.end_time:
+            s.end_time = timestamp
+
     def _write_raw_message(
         self, writer: Writer, topic: str, schema_name: str, schema_text: str,
         raw_data: bytes, timestamp: int,
@@ -521,6 +539,7 @@ class McapBagProcessor:
             data=raw_data,
             publish_time=timestamp
         )
+        self._track_output(topic, schema_name, timestamp)
     
     def _write_encoded_message(
         self, writer: Writer, topic: str, schema_name: str, schema_text: str,
@@ -544,6 +563,7 @@ class McapBagProcessor:
                 data=encoded,
                 publish_time=timestamp
             )
+            self._track_output(topic, schema_name, timestamp)
         except Exception as e:
             print(f"Warning: Failed to encode message for {topic}: {e}")
     
@@ -671,6 +691,125 @@ float64 x
 float64 y
 float64 z
 """.strip()
+
+
+DEFAULT_QOS_PROFILE = (
+    "- history: 3\n"
+    "  depth: 0\n"
+    "  reliability: 1\n"
+    "  durability: 2\n"
+    "  deadline:\n"
+    "    sec: 9223372036\n"
+    "    nsec: 854775807\n"
+    "  lifespan:\n"
+    "    sec: 9223372036\n"
+    "    nsec: 854775807\n"
+    "  liveliness: 1\n"
+    "  liveliness_lease_duration:\n"
+    "    sec: 9223372036\n"
+    "    nsec: 854775807\n"
+    "  avoid_ros_namespace_conventions: false"
+)
+
+
+def generate_rosbag2_metadata(
+    output_dir: str,
+    all_stats: List[ProcessingStats],
+) -> str:
+    """Generate a rosbag2 metadata.yaml from processing statistics.
+
+    Uses the metadata collected during processing (topic types, message
+    counts, timestamps) so we never need to re-read potentially large
+    MCAP files.  The resulting metadata.yaml makes the output directory
+    a valid rosbag2 bag openable by Foxglove and ``ros2 bag``.
+
+    Returns the path to the written metadata.yaml.
+    """
+    topic_msg_counts: Dict[str, int] = {}
+    topic_types: Dict[str, str] = {}
+    global_start: Optional[int] = None
+    global_end: Optional[int] = None
+    total_messages = 0
+    file_entries: List[dict] = []
+
+    for stats in all_stats:
+        file_msg_count = sum(stats.output_topic_counts.values())
+        total_messages += file_msg_count
+
+        for topic, schema_name in stats.output_topic_types.items():
+            topic_types.setdefault(topic, schema_name)
+        for topic, count in stats.output_topic_counts.items():
+            topic_msg_counts[topic] = topic_msg_counts.get(topic, 0) + count
+
+        if stats.start_time is not None:
+            global_start = (
+                min(global_start, stats.start_time) if global_start is not None
+                else stats.start_time
+            )
+        if stats.end_time is not None:
+            global_end = (
+                max(global_end, stats.end_time) if global_end is not None
+                else stats.end_time
+            )
+
+        file_dur = (
+            (stats.end_time - stats.start_time)
+            if (stats.start_time is not None and stats.end_time is not None)
+            else 0
+        )
+        file_entries.append({
+            'path': os.path.basename(stats.output_path),
+            'starting_time': {
+                'nanoseconds_since_epoch': stats.start_time or 0,
+            },
+            'duration': {'nanoseconds': file_dur},
+            'message_count': file_msg_count,
+        })
+
+    duration_ns = (
+        (global_end - global_start)
+        if (global_start is not None and global_end is not None) else 0
+    )
+
+    topics_with_message_count = []
+    for topic in sorted(topic_types):
+        topics_with_message_count.append({
+            'topic_metadata': {
+                'name': topic,
+                'type': topic_types[topic],
+                'serialization_format': 'cdr',
+                'offered_qos_profiles': DEFAULT_QOS_PROFILE,
+            },
+            'message_count': topic_msg_counts.get(topic, 0),
+        })
+
+    metadata = {
+        'rosbag2_bagfile_information': {
+            'version': 5,
+            'storage_identifier': 'mcap',
+            'duration': {'nanoseconds': duration_ns},
+            'starting_time': {
+                'nanoseconds_since_epoch': global_start or 0,
+            },
+            'message_count': total_messages,
+            'topics_with_message_count': topics_with_message_count,
+            'compression_format': '',
+            'compression_mode': '',
+            'relative_file_paths': [
+                os.path.basename(s.output_path) for s in all_stats
+            ],
+            'files': file_entries,
+        }
+    }
+
+    metadata_path = os.path.join(output_dir, 'metadata.yaml')
+    with open(metadata_path, 'w') as f:
+        yaml.dump(
+            metadata, f,
+            default_flow_style=False, sort_keys=False, width=10000,
+        )
+
+    return metadata_path
 
 
 if __name__ == '__main__':

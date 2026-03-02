@@ -14,7 +14,10 @@ from tkinter import ttk, filedialog, messagebox
 from typing import List
 
 from .preferences import load_preferences, save_preferences
-from .processor import McapBagProcessor, ProcessorConfig, DEFAULT_TOPICS
+from .processor import (
+    McapBagProcessor, ProcessorConfig, DEFAULT_TOPICS,
+    generate_rosbag2_metadata,
+)
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -466,6 +469,7 @@ class McapProcessorGUI:
     def _batch_thread(self, mcap_files: List[str], output_dir: str):
         total_files = len(mcap_files)
         failed = 0
+        all_stats = []
 
         for idx, mcap_path in enumerate(mcap_files):
             bag_name = os.path.basename(mcap_path)
@@ -503,6 +507,7 @@ class McapProcessorGUI:
                 processor = McapBagProcessor(config)
                 processor.set_progress_callback(_progress_cb)
                 stats = processor.process()
+                all_stats.append(stats)
 
                 def _log_stats(s=stats):
                     parts = [
@@ -521,6 +526,18 @@ class McapProcessorGUI:
                 failed += 1
                 tb = traceback.format_exc()
                 self.root.after(0, lambda e=exc, t=tb: self._log(f"  ERROR: {e}\n{t}"))
+
+        # Generate rosbag2 metadata.yaml so the output directory is a valid bag
+        if all_stats:
+            try:
+                meta_path = generate_rosbag2_metadata(output_dir, all_stats)
+                self.root.after(0, lambda p=meta_path: self._log(
+                    f"  Wrote {p}"
+                ))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._log(
+                    f"  Warning: could not write metadata.yaml: {e}"
+                ))
 
         self.root.after(0, lambda: self._batch_complete(total_files, failed))
 
