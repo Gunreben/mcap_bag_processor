@@ -169,7 +169,7 @@ class McapBagProcessor:
     - filtered ZED pointclouds
     """
     
-    def __init__(self, config: ProcessorConfig):
+    def __init__(self, config: ProcessorConfig, lidar_odom: Optional[LidarOdometry] = None):
         self.config = config
         self.stats = ProcessingStats()
         self.progress_callback: Optional[Callable[[float, str], None]] = None
@@ -195,10 +195,14 @@ class McapBagProcessor:
                     "kiss-icp is required for LiDAR odometry. "
                     "Install it with: pip install kiss-icp"
                 )
-            self.lidar_odom = LidarOdometry(
-                max_range=config.lidar_odom_max_range,
-                min_range=config.lidar_odom_min_range,
-            )
+            # Reuse existing instance to maintain pose + map continuity across bags
+            if lidar_odom is not None:
+                self.lidar_odom = lidar_odom
+            else:
+                self.lidar_odom = LidarOdometry(
+                    max_range=config.lidar_odom_max_range,
+                    min_range=config.lidar_odom_min_range,
+                )
             # Look up base_link->os_sensor from URDF for proper TF computation
             for tf in self.transforms:
                 if tf.child_frame == 'os_sensor' and tf.parent_frame == 'base_link':

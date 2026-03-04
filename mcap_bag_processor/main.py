@@ -470,6 +470,8 @@ class McapProcessorGUI:
         total_files = len(mcap_files)
         failed = 0
         all_stats = []
+        # Persist LiDAR odometry across bags so pose + map carry over
+        shared_lidar_odom = None
 
         for idx, mcap_path in enumerate(mcap_files):
             bag_name = os.path.basename(mcap_path)
@@ -504,10 +506,12 @@ class McapProcessorGUI:
                 self.root.after(0, lambda o=overall, s=msg: self._update_progress(o, s))
 
             try:
-                processor = McapBagProcessor(config)
+                processor = McapBagProcessor(config, lidar_odom=shared_lidar_odom)
                 processor.set_progress_callback(_progress_cb)
                 stats = processor.process()
                 all_stats.append(stats)
+                if processor.lidar_odom is not None:
+                    shared_lidar_odom = processor.lidar_odom
 
                 def _log_stats(s=stats):
                     parts = [
