@@ -101,8 +101,11 @@ def load_intrinsics_yaml(yaml_path: str) -> Optional[CameraIntrinsics]:
     else:
         projection_matrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]
     
-    # Frame ID follows ROS convention: camera_<id>
-    frame_id = f"camera_{camera_id}"
+    # Frame ID: ZED cameras use <id>_optical_frame; surround cameras use camera_<id>
+    if camera_id.startswith('zed_'):
+        frame_id = f"{camera_id}_optical_frame"
+    else:
+        frame_id = f"camera_{camera_id}"
     
     return CameraIntrinsics(
         camera_name=camera_name,
