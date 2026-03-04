@@ -69,6 +69,7 @@ DEFAULT_TOPICS = [
 
 # Topics that are passthrough (copy raw bytes as-is)
 PASSTHROUGH_TOPICS = {
+    '/bf/points_raw',
     '/camera/rear_left/image_raw/compressed',
     '/camera/rear_mid/image_raw/compressed',
     '/camera/rear_right/image_raw/compressed',
