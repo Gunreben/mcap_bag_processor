@@ -16,6 +16,8 @@ DEFAULTS: Dict[str, Any] = {
     "calibration_dir": "/home/gunreben/ros2_ws/src/tractor_multi_cam_publisher/calibration",
     "last_input_dir": "",
     "last_output_dir": "",
+    "ego_filter_min": [-1.6, -2.4, -0.2],
+    "ego_filter_max": [1.6, 2.8, 3.2],
 }
 
 

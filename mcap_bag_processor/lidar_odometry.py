@@ -18,6 +18,24 @@ except ImportError:
     KISS_ICP_AVAILABLE = False
 
 
+DEFAULT_EGO_MIN = (-1.6, -2.4, -0.2)
+DEFAULT_EGO_MAX = (1.6, 2.8, 3.2)
+
+
+def filter_ego_vehicle(
+    points: np.ndarray,
+    min_point: tuple = DEFAULT_EGO_MIN,
+    max_point: tuple = DEFAULT_EGO_MAX,
+) -> np.ndarray:
+    """Remove points inside an axis-aligned bounding box (the ego vehicle)."""
+    inside = (
+        (points[:, 0] >= min_point[0]) & (points[:, 0] <= max_point[0]) &
+        (points[:, 1] >= min_point[1]) & (points[:, 1] <= max_point[1]) &
+        (points[:, 2] >= min_point[2]) & (points[:, 2] <= max_point[2])
+    )
+    return points[~inside]
+
+
 def extract_xyz_from_pointcloud2(msg_data) -> np.ndarray:
     """Extract Nx3 float64 XYZ array from a PointCloud2 message (dict or object)."""
     if isinstance(msg_data, dict):
@@ -203,7 +221,14 @@ def build_sensor_transform(
 class LidarOdometry:
     """KISS-ICP based LiDAR odometry wrapper."""
 
-    def __init__(self, max_range: float = 100.0, min_range: float = 1.0):
+    def __init__(
+        self,
+        max_range: float = 100.0,
+        min_range: float = 1.0,
+        ego_filter: bool = False,
+        ego_min: tuple = DEFAULT_EGO_MIN,
+        ego_max: tuple = DEFAULT_EGO_MAX,
+    ):
         if not KISS_ICP_AVAILABLE:
             raise ImportError(
                 "kiss-icp is not installed. Install it with: pip install kiss-icp"
@@ -216,6 +241,9 @@ class LidarOdometry:
             config.mapping.voxel_size = float(max_range / 100.0)
         self._odom = KissICP(config=config)
         self._frame_count = 0
+        self._ego_filter = ego_filter
+        self._ego_min = ego_min
+        self._ego_max = ego_max
 
     @property
     def last_pose(self) -> np.ndarray:
@@ -237,6 +265,11 @@ class LidarOdometry:
         points = extract_xyz_from_pointcloud2(msg_data)
         if points.shape[0] == 0:
             return None
+
+        if self._ego_filter:
+            points = filter_ego_vehicle(points, self._ego_min, self._ego_max)
+            if points.shape[0] == 0:
+                return None
 
         timestamps = np.zeros(points.shape[0])
         self._odom.register_frame(points, timestamps=timestamps)

@@ -85,7 +85,7 @@ class PreferencesDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk):
         super().__init__(parent)
         self.title("Preferences")
-        self.geometry("620x200")
+        self.geometry("620x320")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -93,6 +93,15 @@ class PreferencesDialog(tk.Toplevel):
         self.prefs = load_preferences()
         self._urdf = tk.StringVar(value=self.prefs.get("urdf_path", ""))
         self._calib = tk.StringVar(value=self.prefs.get("calibration_dir", ""))
+
+        ego_min = self.prefs.get("ego_filter_min", [-1.6, -2.4, -0.2])
+        ego_max = self.prefs.get("ego_filter_max", [1.6, 2.8, 3.2])
+        self._ego_min_x = tk.StringVar(value=str(ego_min[0]))
+        self._ego_min_y = tk.StringVar(value=str(ego_min[1]))
+        self._ego_min_z = tk.StringVar(value=str(ego_min[2]))
+        self._ego_max_x = tk.StringVar(value=str(ego_max[0]))
+        self._ego_max_y = tk.StringVar(value=str(ego_max[1]))
+        self._ego_max_z = tk.StringVar(value=str(ego_max[2]))
 
         body = ttk.Frame(self, padding=16)
         body.pack(fill=tk.BOTH, expand=True)
@@ -102,24 +111,50 @@ class PreferencesDialog(tk.Toplevel):
             row=0, column=0, sticky="w", pady=4,
         )
         ttk.Entry(body, textvariable=self._urdf).grid(
-            row=0, column=1, sticky="ew", padx=(8, 4), pady=4,
+            row=0, column=1, sticky="ew", padx=(8, 4), pady=4, columnspan=2,
         )
         ttk.Button(body, text="Browse...", command=self._browse_urdf).grid(
-            row=0, column=2, pady=4,
+            row=0, column=3, pady=4,
         )
 
         ttk.Label(body, text="Default Calibration Dir:").grid(
             row=1, column=0, sticky="w", pady=4,
         )
         ttk.Entry(body, textvariable=self._calib).grid(
-            row=1, column=1, sticky="ew", padx=(8, 4), pady=4,
+            row=1, column=1, sticky="ew", padx=(8, 4), pady=4, columnspan=2,
         )
         ttk.Button(body, text="Browse...", command=self._browse_calib).grid(
-            row=1, column=2, pady=4,
+            row=1, column=3, pady=4,
         )
 
+        # Ego vehicle bounding box
+        ttk.Separator(body, orient=tk.HORIZONTAL).grid(
+            row=2, column=0, columnspan=4, sticky="ew", pady=(10, 6),
+        )
+        ttk.Label(body, text="Ego Vehicle Filter Bounding Box", font=("Segoe UI", 10, "bold")).grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(0, 4),
+        )
+
+        ttk.Label(body, text="Min (x, y, z):").grid(row=4, column=0, sticky="w", pady=4)
+        ego_min_frame = ttk.Frame(body)
+        ego_min_frame.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(8, 4), pady=4)
+        for i, (var, lbl) in enumerate(zip(
+            [self._ego_min_x, self._ego_min_y, self._ego_min_z], ["x", "y", "z"],
+        )):
+            ttk.Label(ego_min_frame, text=lbl).pack(side=tk.LEFT, padx=(0 if i == 0 else 8, 2))
+            ttk.Entry(ego_min_frame, textvariable=var, width=8).pack(side=tk.LEFT)
+
+        ttk.Label(body, text="Max (x, y, z):").grid(row=5, column=0, sticky="w", pady=4)
+        ego_max_frame = ttk.Frame(body)
+        ego_max_frame.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(8, 4), pady=4)
+        for i, (var, lbl) in enumerate(zip(
+            [self._ego_max_x, self._ego_max_y, self._ego_max_z], ["x", "y", "z"],
+        )):
+            ttk.Label(ego_max_frame, text=lbl).pack(side=tk.LEFT, padx=(0 if i == 0 else 8, 2))
+            ttk.Entry(ego_max_frame, textvariable=var, width=8).pack(side=tk.LEFT)
+
         btn_row = ttk.Frame(body)
-        btn_row.grid(row=2, column=0, columnspan=3, pady=(16, 0), sticky="e")
+        btn_row.grid(row=6, column=0, columnspan=4, pady=(16, 0), sticky="e")
         ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(
             side=tk.RIGHT, padx=(8, 0),
         )
@@ -146,6 +181,24 @@ class PreferencesDialog(tk.Toplevel):
     def _save(self):
         self.prefs["urdf_path"] = self._urdf.get()
         self.prefs["calibration_dir"] = self._calib.get()
+        try:
+            self.prefs["ego_filter_min"] = [
+                float(self._ego_min_x.get()),
+                float(self._ego_min_y.get()),
+                float(self._ego_min_z.get()),
+            ]
+            self.prefs["ego_filter_max"] = [
+                float(self._ego_max_x.get()),
+                float(self._ego_max_y.get()),
+                float(self._ego_max_z.get()),
+            ]
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Input",
+                "Ego vehicle bounding box values must be numbers.",
+                parent=self,
+            )
+            return
         save_preferences(self.prefs)
         self.destroy()
 
@@ -177,6 +230,7 @@ class McapProcessorGUI:
         self.generate_camera_info = tk.BooleanVar(value=True)
         self.filter_pointcloud = tk.BooleanVar(value=True)
         self.generate_lidar_odom = tk.BooleanVar(value=False)
+        self.filter_ego_vehicle = tk.BooleanVar(value=True)
         self.fix_ouster_timestamps = tk.BooleanVar(value=False)
 
         self.processing = False
@@ -293,8 +347,11 @@ class McapProcessorGUI:
         ttk.Checkbutton(opt_grid, text="Generate LiDAR odometry (KISS-ICP)", variable=self.generate_lidar_odom).grid(
             row=2, column=0, sticky="w", pady=2,
         )
-        ttk.Checkbutton(opt_grid, text="Fix Ouster timestamps (internal osc → wall clock)", variable=self.fix_ouster_timestamps).grid(
+        ttk.Checkbutton(opt_grid, text="Filter ego vehicle from LiDAR", variable=self.filter_ego_vehicle).grid(
             row=2, column=1, sticky="w", pady=2,
+        )
+        ttk.Checkbutton(opt_grid, text="Fix Ouster timestamps (internal osc → wall clock)", variable=self.fix_ouster_timestamps).grid(
+            row=3, column=0, sticky="w", pady=2,
         )
 
         row += 1
@@ -473,6 +530,10 @@ class McapProcessorGUI:
         # Persist LiDAR odometry across bags so pose + map carry over
         shared_lidar_odom = None
 
+        prefs = load_preferences()
+        ego_min = tuple(prefs.get("ego_filter_min", [-1.6, -2.4, -0.2]))
+        ego_max = tuple(prefs.get("ego_filter_max", [1.6, 2.8, 3.2]))
+
         for idx, mcap_path in enumerate(mcap_files):
             bag_name = os.path.basename(mcap_path)
             if bag_name.endswith(".mcap"):
@@ -496,6 +557,9 @@ class McapProcessorGUI:
                 add_map_odom_tf=self.add_map_odom_tf.get(),
                 generate_lidar_odom=self.generate_lidar_odom.get(),
                 fix_ouster_timestamps=self.fix_ouster_timestamps.get(),
+                lidar_ego_filter=self.filter_ego_vehicle.get(),
+                lidar_ego_min=ego_min,
+                lidar_ego_max=ego_max,
             )
 
             file_idx = idx

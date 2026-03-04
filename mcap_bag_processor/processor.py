@@ -24,6 +24,7 @@ from .camera_info import (
 from .pointcloud import filter_zed_pointcloud
 from .lidar_odometry import (
     LidarOdometry, KISS_ICP_AVAILABLE,
+    DEFAULT_EGO_MIN, DEFAULT_EGO_MAX,
     pose_to_odometry_dict, pose_to_tf_msg_dict,
     compute_odom_base_link, compute_odom_sensor, build_sensor_transform,
 )
@@ -157,6 +158,9 @@ class ProcessorConfig:
     pointcloud_max_range: float = 100.0
     lidar_odom_max_range: float = 100.0
     lidar_odom_min_range: float = 1.0
+    lidar_ego_filter: bool = True
+    lidar_ego_min: tuple = DEFAULT_EGO_MIN
+    lidar_ego_max: tuple = DEFAULT_EGO_MAX
 
 
 class McapBagProcessor:
@@ -202,6 +206,9 @@ class McapBagProcessor:
                 self.lidar_odom = LidarOdometry(
                     max_range=config.lidar_odom_max_range,
                     min_range=config.lidar_odom_min_range,
+                    ego_filter=config.lidar_ego_filter,
+                    ego_min=config.lidar_ego_min,
+                    ego_max=config.lidar_ego_max,
                 )
             # Look up base_link->os_sensor from URDF for proper TF computation
             for tf in self.transforms:
