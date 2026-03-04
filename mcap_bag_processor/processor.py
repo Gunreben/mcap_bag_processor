@@ -30,9 +30,18 @@ from .lidar_odometry import (
 )
 
 
+# Odometry source choices
+ODOM_SOURCE_NONE = 'none'
+ODOM_SOURCE_KISS_ICP = 'kiss_icp'
+ODOM_SOURCE_NOVATEL = 'novatel'
+ODOM_SOURCES = [ODOM_SOURCE_NONE, ODOM_SOURCE_KISS_ICP, ODOM_SOURCE_NOVATEL]
+
 # LiDAR odometry constants
 LIDAR_POINTS_TOPIC = '/ouster/points'
 LIDAR_ODOM_OUTPUT_TOPIC = '/kiss_icp/odom'
+
+# Novatel odometry constants
+NOVATEL_ODOM_TOPIC = '/novatel/oem7/odom'
 
 # Topics whose header.stamp may use the Ouster internal oscillator (boot time)
 # instead of Unix epoch time. When fix_ouster_timestamps is enabled, their
@@ -128,7 +137,7 @@ class ProcessingStats:
     passthrough_messages: int = 0
     generated_camera_info: int = 0
     filtered_pointclouds: int = 0
-    generated_lidar_odom: int = 0
+    generated_odom_tf: int = 0
     patched_ouster_timestamps: int = 0
     skipped_messages: int = 0
     topics_found: Set[str] = field(default_factory=set)
@@ -152,7 +161,7 @@ class ProcessorConfig:
     generate_camera_info: bool = True
     generate_tf_static: bool = True
     add_map_odom_tf: bool = True
-    generate_lidar_odom: bool = False
+    odom_source: str = ODOM_SOURCE_NONE
     fix_ouster_timestamps: bool = False
     pointcloud_voxel_size: float = 0.2
     pointcloud_min_points: int = 2
@@ -191,10 +200,11 @@ class McapBagProcessor:
         if config.generate_camera_info and config.calibration_dir:
             self.camera_intrinsics = load_all_intrinsics(config.calibration_dir)
         
-        # Initialise LiDAR odometry (KISS-ICP)
+        # Initialise odometry source
         self.lidar_odom: Optional[LidarOdometry] = None
         self._T_base_sensor: Optional[Any] = None
-        if config.generate_lidar_odom:
+
+        if config.odom_source == ODOM_SOURCE_KISS_ICP:
             if not KISS_ICP_AVAILABLE:
                 raise ImportError(
                     "kiss-icp is required for LiDAR odometry. "
@@ -218,7 +228,10 @@ class McapBagProcessor:
                         tf.translation, tf.rotation,
                     )
                     break
-            # Remove odom->base_link identity from static TFs (dynamic TF replaces it)
+
+        # Remove odom->base_link identity from static TFs when any odom source
+        # provides a dynamic transform for it.
+        if config.odom_source != ODOM_SOURCE_NONE:
             self.transforms = [
                 tf for tf in self.transforms
                 if not (tf.parent_frame == 'odom' and tf.child_frame == 'base_link')
@@ -416,7 +429,7 @@ class McapBagProcessor:
                                 )
                                 self.stats.generated_camera_info += 1
                     
-                    # Generate LiDAR odometry from Ouster pointclouds
+                    # Generate odometry TF from selected source
                     if (self.lidar_odom is not None and
                             channel.topic == LIDAR_POINTS_TOPIC):
                         try:
@@ -441,7 +454,6 @@ class McapBagProcessor:
                                         T_odom_base = T_kiss
                                         T_odom_sensor = T_kiss
 
-                                    # Write corrected nav_msgs/Odometry
                                     corrected_odom = pose_to_odometry_dict(
                                         T_odom_sensor, message.log_time,
                                         frame_id='odom',
@@ -455,7 +467,6 @@ class McapBagProcessor:
                                         registered_channels, schemas, schema_texts
                                     )
 
-                                    # Write odom->base_link on /tf
                                     tf_msg = pose_to_tf_msg_dict(
                                         T_odom_base, message.log_time,
                                         frame_id='odom',
@@ -468,9 +479,25 @@ class McapBagProcessor:
                                         tf_msg, message.log_time,
                                         registered_channels, schemas, schema_texts
                                     )
-                                    self.stats.generated_lidar_odom += 1
+                                    self.stats.generated_odom_tf += 1
                         except Exception as e:
                             print(f"Warning: LiDAR odometry failed on frame: {e}")
+
+                    if (self.config.odom_source == ODOM_SOURCE_NOVATEL and
+                            channel.topic == NOVATEL_ODOM_TOPIC):
+                        try:
+                            decoder = DecoderFactory()
+                            decoder_fn = decoder.decoder_for('cdr', schema)
+                            if decoder_fn:
+                                decoded_msg = decoder_fn(message.data)
+                                odom_dict = self._msg_to_dict(decoded_msg)
+                                self._write_novatel_tf(
+                                    writer, odom_dict, message.log_time,
+                                    registered_channels, schemas, schema_texts,
+                                )
+                                self.stats.generated_odom_tf += 1
+                        except Exception as e:
+                            print(f"Warning: Novatel odom TF failed: {e}")
                 
                 writer.finish()
         
@@ -592,6 +619,46 @@ class McapBagProcessor:
             'tf2_msgs/msg/TFMessage', TF_MESSAGE_SCHEMA,
             tf_msg, timestamp,
             registered_channels, schemas, schema_texts
+        )
+
+    def _write_novatel_tf(
+        self, writer: Writer, odom_dict: dict, timestamp: int,
+        registered_channels: Dict[str, int], schemas: Dict[str, int],
+        schema_texts: Dict[str, str],
+    ):
+        """Extract pose from a decoded nav_msgs/Odometry and write odom->base_link TF."""
+        pose = odom_dict.get('pose', {}).get('pose', {})
+        pos = pose.get('position', {})
+        ori = pose.get('orientation', {})
+
+        stamp = {
+            'sec': int(timestamp // 1_000_000_000),
+            'nanosec': int(timestamp % 1_000_000_000),
+        }
+        tf_msg = {
+            'transforms': [{
+                'header': {'stamp': stamp, 'frame_id': 'odom'},
+                'child_frame_id': 'base_link',
+                'transform': {
+                    'translation': {
+                        'x': float(pos.get('x', 0.0)),
+                        'y': float(pos.get('y', 0.0)),
+                        'z': float(pos.get('z', 0.0)),
+                    },
+                    'rotation': {
+                        'x': float(ori.get('x', 0.0)),
+                        'y': float(ori.get('y', 0.0)),
+                        'z': float(ori.get('z', 0.0)),
+                        'w': float(ori.get('w', 1.0)),
+                    },
+                },
+            }],
+        }
+        self._write_encoded_message(
+            writer, '/tf',
+            'tf2_msgs/msg/TFMessage', TF_MESSAGE_SCHEMA,
+            tf_msg, timestamp,
+            registered_channels, schemas, schema_texts,
         )
 
 

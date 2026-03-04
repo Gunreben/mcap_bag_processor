@@ -16,6 +16,7 @@ from typing import List
 from .preferences import load_preferences, save_preferences
 from .processor import (
     McapBagProcessor, ProcessorConfig, DEFAULT_TOPICS,
+    ODOM_SOURCES, ODOM_SOURCE_NONE, ODOM_SOURCE_KISS_ICP,
     generate_rosbag2_metadata,
 )
 
@@ -68,6 +69,8 @@ def _configure_styles():
 
     style.configure("TCheckbutton", background=CARD_BG, foreground=TEXT)
     style.map("TCheckbutton", background=[("active", CARD_BG)])
+
+    style.configure("TCombobox", fieldbackground="white")
 
     style.configure(
         "Horizontal.TProgressbar",
@@ -229,7 +232,7 @@ class McapProcessorGUI:
         self.add_map_odom_tf = tk.BooleanVar(value=True)
         self.generate_camera_info = tk.BooleanVar(value=True)
         self.filter_pointcloud = tk.BooleanVar(value=True)
-        self.generate_lidar_odom = tk.BooleanVar(value=False)
+        self.odom_source = tk.StringVar(value=ODOM_SOURCE_NONE)
         self.filter_ego_vehicle = tk.BooleanVar(value=True)
         self.fix_ouster_timestamps = tk.BooleanVar(value=False)
 
@@ -344,12 +347,31 @@ class McapProcessorGUI:
         ttk.Checkbutton(opt_grid, text="Filter ZED pointcloud (alpha + outlier)", variable=self.filter_pointcloud).grid(
             row=1, column=1, sticky="w", pady=2,
         )
-        ttk.Checkbutton(opt_grid, text="Generate LiDAR odometry (KISS-ICP)", variable=self.generate_lidar_odom).grid(
-            row=2, column=0, sticky="w", pady=2,
+        odom_row = ttk.Frame(opt_grid)
+        odom_row.grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(odom_row, text="Odometry source:").pack(side=tk.LEFT, padx=(0, 6))
+        odom_labels = {
+            'none': 'None',
+            'kiss_icp': 'KISS-ICP (LiDAR)',
+            'novatel': 'Novatel GNSS',
+        }
+        self._odom_display = tk.StringVar(value=odom_labels[ODOM_SOURCE_NONE])
+        odom_combo = ttk.Combobox(
+            odom_row, textvariable=self._odom_display,
+            values=[odom_labels[s] for s in ODOM_SOURCES],
+            state='readonly', width=22,
         )
-        ttk.Checkbutton(opt_grid, text="Filter ego vehicle from LiDAR", variable=self.filter_ego_vehicle).grid(
-            row=2, column=1, sticky="w", pady=2,
+        odom_combo.pack(side=tk.LEFT)
+        self._odom_labels = odom_labels
+        self._odom_label_to_key = {v: k for k, v in odom_labels.items()}
+        odom_combo.bind('<<ComboboxSelected>>', self._on_odom_source_changed)
+
+        self._ego_filter_cb = ttk.Checkbutton(
+            opt_grid, text="Filter ego vehicle from LiDAR", variable=self.filter_ego_vehicle,
+            state=tk.DISABLED,
         )
+        self._ego_filter_cb.grid(row=2, column=1, sticky="w", pady=2)
+
         ttk.Checkbutton(opt_grid, text="Fix Ouster timestamps (internal osc → wall clock)", variable=self.fix_ouster_timestamps).grid(
             row=3, column=0, sticky="w", pady=2,
         )
@@ -427,6 +449,17 @@ class McapProcessorGUI:
         path = filedialog.askdirectory(title="Select Calibration Directory")
         if path:
             self.calibration_dir.set(path)
+
+    # -- Odom source selection --
+
+    def _on_odom_source_changed(self, _event=None):
+        key = self._odom_label_to_key.get(self._odom_display.get(), ODOM_SOURCE_NONE)
+        self.odom_source.set(key)
+        # Ego filter is only relevant for KISS-ICP
+        if key == ODOM_SOURCE_KISS_ICP:
+            self._ego_filter_cb.configure(state=tk.NORMAL)
+        else:
+            self._ego_filter_cb.configure(state=tk.DISABLED)
 
     # -- Logging / progress --
 
@@ -555,7 +588,7 @@ class McapProcessorGUI:
                 generate_camera_info=self.generate_camera_info.get(),
                 filter_pointcloud=self.filter_pointcloud.get(),
                 add_map_odom_tf=self.add_map_odom_tf.get(),
-                generate_lidar_odom=self.generate_lidar_odom.get(),
+                odom_source=self.odom_source.get(),
                 fix_ouster_timestamps=self.fix_ouster_timestamps.get(),
                 lidar_ego_filter=self.filter_ego_vehicle.get(),
                 lidar_ego_min=ego_min,
@@ -583,7 +616,7 @@ class McapProcessorGUI:
                         f"Passthrough: {s.passthrough_messages}",
                         f"CameraInfo: {s.generated_camera_info}",
                         f"Filtered PC: {s.filtered_pointclouds}",
-                        f"LiDAR odom: {s.generated_lidar_odom}",
+                        f"Odom TF: {s.generated_odom_tf}",
                     ]
                     if s.patched_ouster_timestamps:
                         parts.append(f"Ouster ts fixed: {s.patched_ouster_timestamps}")
